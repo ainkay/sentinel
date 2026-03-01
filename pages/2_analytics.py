@@ -4,8 +4,12 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler as SklearnScaler
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from src import data_cleaning, feature_engineering, statistical_analysis, risk_index
 
 st.set_page_config(
     page_title="SENTINEL — Analytics",
@@ -192,18 +196,33 @@ if result_df is None:
     df_a = pd.DataFrame(attack_data)
     raw_df = pd.concat([df_n, df_a], ignore_index=True).sample(frac=1, random_state=42)
 
-    scaler = StandardScaler()
-    num_cols = raw_df.select_dtypes(include='number').columns
-    scaled = scaler.fit_transform(raw_df[num_cols])
-    model = IsolationForest(n_estimators=200, contamination=0.08, random_state=42)
-    # train isolation forest on the scaled demo data before making predictions
-    model.fit(scaled)
-    preds = model.predict(scaled)
-    scores = model.decision_function(scaled)
+    # Use statistical methods from src modules
+    num_cols = raw_df.select_dtypes(include='number').columns.tolist()
+    
+    scaler = feature_engineering.StandardScaler()
+    scaled = scaler.fit_transform(raw_df[num_cols].values)
+    
+    zscore_scores = statistical_analysis.compute_deviation_scores(scaled)
+    iqr_scores = np.zeros(len(raw_df))
+    for idx, col in enumerate(num_cols):
+        lower, upper = statistical_analysis.iqr_bounds(raw_df[col], multiplier=1.5)
+        distance = np.maximum(0, raw_df[col].values - upper)
+        distance = np.maximum(distance, lower - raw_df[col].values)
+        iqr_scores += np.abs(distance)
+    iqr_scores = feature_engineering.StandardScaler().fit_transform(iqr_scores.reshape(-1, 1)).flatten()
+    
+    indicators = {'zscore': zscore_scores, 'iqr': iqr_scores}
+    weights = {'zscore': 0.5, 'iqr': 0.5}
+    risk_scores = risk_index.compute_weighted_risk_index(indicators, weights)
+    
     result_df = raw_df.copy()
-    result_df['__anomaly_label'] = pd.Series(preds).map({1: 'Normal', -1: 'Anomalous'}).values
-    result_df['__anomaly_score'] = np.round(scores, 4)
-    result_df['__risk_pct'] = np.round((scores.min() - scores) / (scores.min() - scores.max()) * 100, 1)
+    result_df['__risk_score'] = risk_scores
+    result_df['__risk_category'] = risk_index.categorize_risk(risk_scores)
+    result_df['__is_anomaly'] = result_df['__risk_category'].isin(['HIGH', 'CRITICAL'])
+    result_df['__anomaly_label'] = result_df['__is_anomaly'].map({True: 'Anomalous', False: 'Normal'})
+    result_df['__anomaly_score'] = risk_scores / 100.0
+    result_df['__risk_pct'] = risk_scores
+    result_df['__anomaly_flag'] = result_df['__is_anomaly'].map({True: -1, False: 1})
 
 # ─── PREP ─────────────────────────────────────────────────────────────────────
 numeric_cols = [c for c in result_df.columns if c not in ('__anomaly_flag', '__anomaly_label', '__anomaly_score', '__risk_pct')
@@ -259,8 +278,8 @@ st.markdown('<div class="section-header">▸ PCA ANOMALY MAP — 2D PROJECTION</
 
 if len(numeric_cols) >= 2:
     pca_data = result_df[numeric_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    scaler_pca = StandardScaler()
-    scaled_pca = scaler_pca.fit_transform(pca_data)
+    scaler_pca = SklearnScaler()
+    scaled_pca = scaler_pca.fit_transform(pca_data.values)
     pca = PCA(n_components=2, random_state=42)
     components = pca.fit_transform(scaled_pca)
     var_explained = pca.explained_variance_ratio_
@@ -297,7 +316,6 @@ if len(numeric_cols) >= 2:
     ))
     fig_pca.update_layout(
         **PLOTLY_LAYOUT,
-        # height is specified separately to avoid conflicts with layout defaults
         xaxis_title=f'PC1 ({var_explained[0]*100:.1f}% variance)',
         yaxis_title=f'PC2 ({var_explained[1]*100:.1f}% variance)',
         title=dict(text='', x=0.5)
