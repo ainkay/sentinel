@@ -180,9 +180,12 @@ body, .stApp {
 """, unsafe_allow_html=True)
 
 # ─── IMPORTS ──────────────────────────────────────────────────────────────────
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from src import data_cleaning, feature_engineering, statistical_analysis, risk_index
 
 # ─── RESPONSIVE NAV ───────────────────────────────────────────────────────────
 nav1, nav2, nav3, nav4, nav5 = st.columns([2, 1, 1, 1, 2])
@@ -301,9 +304,7 @@ if 'result_df' in st.session_state and st.session_state['result_df']:
 if df is not None:
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
-    numeric_df = df.select_dtypes(include=['number']).copy()
-    numeric_df = numeric_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how='all')
-    numeric_df = numeric_df.fillna(numeric_df.median())
+    numeric_df = data_cleaning.extract_numeric_data(df, handle_inf=True)
 
     if numeric_df.empty or numeric_df.shape[1] < 2:
         st.error("✗ INSUFFICIENT NUMERIC FEATURES — Minimum 2 required.")
@@ -322,24 +323,52 @@ if df is not None:
                     time.sleep(0.02)
                     progress.progress(i)
 
-                scaler = StandardScaler()
-                scaled = scaler.fit_transform(numeric_df)
-
-                model = IsolationForest(
-                    n_estimators=n_estimators,
-                    contamination=contamination,
-                    random_state=42
+                # ──────────────────────────────────────────────────────────────
+                # NEW: Multi-method anomaly detection using statistical approaches
+                # ──────────────────────────────────────────────────────────────
+                
+                # Prepare data
+                scaler = feature_engineering.StandardScaler()
+                data_scaled = scaler.fit_transform(numeric_df.values)
+                
+                # Method 1: Z-score based detection
+                zscore_anomalies = statistical_analysis.multivariate_zscore_detection(
+                    data_scaled, threshold=2.5
                 )
-                model.fit(scaled)
-                predictions = model.predict(scaled)
-                scores = model.decision_function(scaled)
-
+                zscore_scores = statistical_analysis.compute_deviation_scores(data_scaled)
+                
+                # Method 2: IQR-based detection
+                iqr_anomalies = statistical_analysis.multivariate_iqr_detection(numeric_df, multiplier=1.5)
+                
+                # Compute IQR scores
+                iqr_scores = np.zeros(len(numeric_df))
+                for idx, col in enumerate(numeric_df.columns):
+                    lower, upper = statistical_analysis.iqr_bounds(numeric_df[col], multiplier=1.5)
+                    distance = np.maximum(0, numeric_df[col] - upper)
+                    distance = np.maximum(distance, lower - numeric_df[col])
+                    iqr_scores += np.abs(distance)
+                iqr_scores = feature_engineering.StandardScaler().fit_transform(iqr_scores.values.reshape(-1, 1)).flatten()
+                
+                # Combine methods into weighted risk index
+                indicators = {
+                    'zscore': zscore_scores,
+                    'iqr': iqr_scores
+                }
+                weights = {'zscore': 0.5, 'iqr': 0.5}
+                risk_scores = risk_index.compute_weighted_risk_index(indicators, weights)
+                
+                # Create result dataframe
                 result_df = df.copy()
-                result_df['__anomaly_flag'] = predictions
-                result_df['__anomaly_label'] = result_df['__anomaly_flag'].map({1: 'Normal', -1: 'Anomalous'})
-                result_df['__anomaly_score'] = np.round(scores, 4)
-                result_df['__risk_pct'] = np.round((scores.min() - scores) / (scores.min() - scores.max()) * 100, 1)
-                # persist scan output so we can show results after reruns or when clicking analytics
+                result_df['__risk_score'] = risk_scores
+                result_df['__risk_category'] = risk_index.categorize_risk(risk_scores)
+                result_df['__is_anomaly'] = result_df['__risk_category'].isin(['HIGH', 'CRITICAL'])
+                result_df['__anomaly_label'] = result_df['__is_anomaly'].map({True: 'Anomalous', False: 'Normal'})
+                
+                # For backwards compatibility with analytics page
+                result_df['__anomaly_score'] = risk_scores / 100.0
+                result_df['__risk_pct'] = risk_scores
+                result_df['__anomaly_flag'] = result_df['__is_anomaly'].map({True: -1, False: 1})
+                
                 st.session_state['result_df'] = result_df.to_json()
                 scan_done = True
 
@@ -422,8 +451,8 @@ if df is not None:
             with col_chart1:
                 st.markdown("**▸ ANOMALY SCORE DISTRIBUTION**", unsafe_allow_html=False)
 
-                normal_scores = result_df[result_df['__anomaly_label'] == 'Normal']['__anomaly_score']
-                anom_scores = result_df[result_df['__anomaly_label'] == 'Anomalous']['__anomaly_score']
+                normal_scores = result_df[result_df['__anomaly_label'] == 'Normal']['__risk_pct']
+                anom_scores = result_df[result_df['__anomaly_label'] == 'Anomalous']['__risk_pct']
 
                 fig1 = go.Figure()
                 fig1.add_trace(go.Histogram(
@@ -442,7 +471,7 @@ if df is not None:
                     plot_bgcolor='rgba(0,10,20,0.5)',
                     font=dict(color='rgba(0,245,255,0.7)', family='Share Tech Mono'),
                     legend=dict(font=dict(color='rgba(0,245,255,0.7)')),
-                    xaxis=dict(gridcolor='rgba(0,245,255,0.08)', title='Anomaly Score'),
+                    xaxis=dict(gridcolor='rgba(0,245,255,0.08)', title='Risk Score (0-100)'),
                     yaxis=dict(gridcolor='rgba(0,245,255,0.08)', title='Count'),
                     margin=dict(l=10, r=10, t=20, b=10),
                     height=280
@@ -483,11 +512,12 @@ if df is not None:
             flagged = flagged.sort_values('__risk_pct', ascending=False)
 
             display_cols = [c for c in flagged.columns if not c.startswith('__')][:12]
-            display_cols += ['__anomaly_score', '__risk_pct', '__anomaly_label']
+            display_cols += ['__risk_score', '__risk_category', '__risk_pct', '__anomaly_label']
 
             st.dataframe(
                 flagged[display_cols].head(100).rename(columns={
-                    '__anomaly_score': 'Score',
+                    '__risk_score': 'Risk Score',
+                    '__risk_category': 'Category',
                     '__risk_pct': 'Risk%',
                     '__anomaly_label': 'Status'
                 }),
@@ -500,7 +530,7 @@ if df is not None:
             with col_dl1:
                 csv_all = result_df.rename(columns={
                     '__anomaly_label': 'Status',
-                    '__anomaly_score': 'Score',
+                    '__risk_score': 'Risk_Score',
                     '__risk_pct': 'Risk%'
                 }).to_csv(index=False)
                 st.download_button(
@@ -513,7 +543,7 @@ if df is not None:
             with col_dl2:
                 csv_flagged = flagged.rename(columns={
                     '__anomaly_label': 'Status',
-                    '__anomaly_score': 'Score',
+                    '__risk_score': 'Risk_Score',
                     '__risk_pct': 'Risk%'
                 }).to_csv(index=False)
                 st.download_button(
