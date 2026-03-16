@@ -9,7 +9,16 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src import data_cleaning, feature_engineering, statistical_analysis, risk_index
+from src import (
+    data_cleaning,
+    feature_engineering,
+    ml_anomaly,
+    ml_clustering,
+    ml_representation,
+    ml_risk_model,
+    risk_index,
+    statistical_analysis,
+)
 
 st.set_page_config(
     page_title="SENTINEL — Analytics",
@@ -123,6 +132,103 @@ PLOTLY_LAYOUT = dict(
     # height removed here; charts will specify explicit heights when needed
 )
 
+
+def enrich_with_ml_outputs(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Ensure the analytics view has both statistical and ML-derived outputs."""
+    result = dataframe.copy()
+    numeric_df = data_cleaning.extract_numeric_data(result, handle_inf=True)
+
+    if numeric_df.empty or numeric_df.shape[1] < 2:
+        return result
+
+    if '__risk_pct' not in result.columns:
+        scaler = feature_engineering.StandardScaler()
+        scaled = scaler.fit_transform(numeric_df.values)
+        zscore_scores = statistical_analysis.compute_deviation_scores(scaled)
+
+        iqr_scores = np.zeros(len(numeric_df))
+        for col in numeric_df.columns:
+            lower, upper = statistical_analysis.iqr_bounds(numeric_df[col], multiplier=1.5)
+            distance = np.maximum(0, numeric_df[col].values - upper)
+            distance = np.maximum(distance, lower - numeric_df[col].values)
+            iqr_scores += np.abs(distance)
+        iqr_scores = feature_engineering.StandardScaler().fit_transform(
+            iqr_scores.reshape(-1, 1)
+        ).flatten()
+
+        indicators = {'zscore': zscore_scores, 'iqr': iqr_scores}
+        statistical_risk = risk_index.compute_weighted_risk_index(
+            indicators,
+            {'zscore': 0.5, 'iqr': 0.5}
+        )
+        result['__risk_score'] = statistical_risk
+        result['__risk_category'] = risk_index.categorize_risk(statistical_risk)
+        result['__is_anomaly'] = result['__risk_category'].isin(['HIGH', 'CRITICAL'])
+        result['__anomaly_label'] = np.where(result['__is_anomaly'], 'Anomalous', 'Normal')
+        result['__anomaly_score'] = statistical_risk / 100.0
+        result['__risk_pct'] = statistical_risk
+        result['__anomaly_flag'] = np.where(result['__is_anomaly'], -1, 1)
+        result['__statistical_risk_score'] = statistical_risk
+        result['__statistical_risk_category'] = result['__risk_category']
+        result['__statistical_anomaly_score'] = statistical_risk / 100.0
+
+    if '__ml_risk_score' not in result.columns:
+        isolation_model = ml_anomaly.train_isolation_forest(numeric_df)
+        isolation_scores = ml_anomaly.get_anomaly_scores(numeric_df, model=isolation_model)
+        isolation_flags = ml_anomaly.predict_anomalies(numeric_df, model=isolation_model)
+        pca_result = ml_representation.run_pca(numeric_df, n_components=2)
+        pca_components = pca_result['components']
+        kmeans_result = ml_clustering.run_kmeans(numeric_df, k=4)
+        dbscan_result = ml_clustering.run_dbscan(numeric_df)
+
+        euclidean_scores = ml_risk_model.euclidean_distance_score(
+            kmeans_result['processed_data'],
+            kmeans_result['cluster_centers']
+        )
+        mahalanobis_scores = ml_risk_model.mahalanobis_distance_score(
+            kmeans_result['processed_data']
+        )
+        distance_scores = (euclidean_scores + mahalanobis_scores) / 2.0
+        cluster_rarity_scores = np.maximum(
+            kmeans_result['rarity_scores'],
+            dbscan_result['rarity_scores']
+        )
+        statistical_risk = result['__risk_pct'].to_numpy(dtype=float)
+        ml_risk_scores = ml_risk_model.compute_ml_risk_score(
+            statistical_risk_score=statistical_risk,
+            isolation_forest_score=isolation_scores,
+            cluster_rarity_score=cluster_rarity_scores,
+            distance_deviation_score=distance_scores,
+        )
+        ml_risk_categories = risk_index.categorize_risk(ml_risk_scores)
+        ml_flags = np.isin(ml_risk_categories, ['HIGH', 'CRITICAL'])
+        result['__iforest_anomaly_score'] = isolation_scores
+        result['__iforest_anomaly_pct'] = isolation_scores * 100.0
+        result['__iforest_is_anomaly'] = isolation_flags
+        result['__iforest_label'] = np.where(isolation_flags, 'Anomalous', 'Normal')
+        result['__cluster_label'] = kmeans_result['labels']
+        result['__dbscan_label'] = dbscan_result['labels']
+        result['__cluster_rarity_score'] = cluster_rarity_scores
+        result['__distance_deviation_score'] = distance_scores
+        result['__mahalanobis_score'] = mahalanobis_scores
+        result['__euclidean_distance_score'] = euclidean_scores
+        result['__ml_risk_score'] = ml_risk_scores
+        result['__ml_risk_category'] = ml_risk_categories
+        result['__ml_is_anomaly'] = ml_flags
+        result['__ml_anomaly_label'] = np.where(ml_flags, 'Anomalous', 'Normal')
+        result['__pca_1'] = pca_components.iloc[:, 0].values
+        result['__pca_2'] = pca_components.iloc[:, 1].values if pca_components.shape[1] > 1 else 0.0
+        result['__pca_variance_1'] = pca_result['explained_variance_ratio'][0]
+        result['__pca_variance_2'] = (
+            pca_result['explained_variance_ratio'][1]
+            if len(pca_result['explained_variance_ratio']) > 1
+            else 0.0
+        )
+        stat_flags = result['__risk_pct'].to_numpy(dtype=float) >= 50
+        result['__risk_alignment'] = np.where(stat_flags == ml_flags, 'Agreement', 'Disagreement')
+
+    return result
+
 # ─── RESPONSIVE NAV ───────────────────────────────────────────────────────────
 nav1, nav2, nav3, nav4, nav5 = st.columns([2, 1, 1, 1, 2])
 with nav1:
@@ -196,43 +302,28 @@ if result_df is None:
     df_a = pd.DataFrame(attack_data)
     raw_df = pd.concat([df_n, df_a], ignore_index=True).sample(frac=1, random_state=42)
 
-    # Use statistical methods from src modules
-    num_cols = raw_df.select_dtypes(include='number').columns.tolist()
-    
-    scaler = feature_engineering.StandardScaler()
-    scaled = scaler.fit_transform(raw_df[num_cols].values)
-    
-    zscore_scores = statistical_analysis.compute_deviation_scores(scaled)
-    iqr_scores = np.zeros(len(raw_df))
-    for idx, col in enumerate(num_cols):
-        lower, upper = statistical_analysis.iqr_bounds(raw_df[col], multiplier=1.5)
-        distance = np.maximum(0, raw_df[col].values - upper)
-        distance = np.maximum(distance, lower - raw_df[col].values)
-        iqr_scores += np.abs(distance)
-    iqr_scores = feature_engineering.StandardScaler().fit_transform(iqr_scores.reshape(-1, 1)).flatten()
-    
-    indicators = {'zscore': zscore_scores, 'iqr': iqr_scores}
-    weights = {'zscore': 0.5, 'iqr': 0.5}
-    risk_scores = risk_index.compute_weighted_risk_index(indicators, weights)
-    
     result_df = raw_df.copy()
-    result_df['__risk_score'] = risk_scores
-    result_df['__risk_category'] = risk_index.categorize_risk(risk_scores)
-    result_df['__is_anomaly'] = result_df['__risk_category'].isin(['HIGH', 'CRITICAL'])
-    result_df['__anomaly_label'] = result_df['__is_anomaly'].map({True: 'Anomalous', False: 'Normal'})
-    result_df['__anomaly_score'] = risk_scores / 100.0
-    result_df['__risk_pct'] = risk_scores
-    result_df['__anomaly_flag'] = result_df['__is_anomaly'].map({True: -1, False: 1})
+
+result_df = enrich_with_ml_outputs(result_df)
 
 # ─── PREP ─────────────────────────────────────────────────────────────────────
-numeric_cols = [c for c in result_df.columns if c not in ('__anomaly_flag', '__anomaly_label', '__anomaly_score', '__risk_pct')
-                and pd.api.types.is_numeric_dtype(result_df[c])]
+numeric_cols = [
+    column for column in result_df.columns
+    if not column.startswith('__') and pd.api.types.is_numeric_dtype(result_df[column])
+]
 
 total = len(result_df)
 anomalies_mask = result_df['__anomaly_label'] == 'Anomalous'
 anomalies = anomalies_mask.sum()
 normal = total - anomalies
 anomaly_pct = anomalies / total * 100
+ml_anomalies_mask = result_df['__ml_is_anomaly'] if '__ml_is_anomaly' in result_df else anomalies_mask
+ml_anomalies = int(ml_anomalies_mask.sum())
+agreement_pct = (
+    (result_df['__risk_alignment'] == 'Agreement').mean() * 100
+    if '__risk_alignment' in result_df.columns and total > 0
+    else 0
+)
 
 # ─── INSIGHT CARDS ────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header">▸ INTELLIGENCE SUMMARY</div>', unsafe_allow_html=True)
@@ -247,12 +338,12 @@ with col1:
         <div class="insight-sub">Mean risk for anomalies</div>
     </div>""", unsafe_allow_html=True)
 with col2:
-    high_risk = (result_df['__risk_pct'] > 75).sum()
+    high_risk = (result_df['__ml_risk_score'] > 75).sum() if '__ml_risk_score' in result_df else (result_df['__risk_pct'] > 75).sum()
     st.markdown(f"""
     <div class="insight-card">
-        <div class="insight-label">Critical Threats</div>
+        <div class="insight-label">ML High-Risk Flows</div>
         <div class="insight-value" style="color:#ff6b35;">{high_risk}</div>
-        <div class="insight-sub">Risk score &gt; 75%</div>
+        <div class="insight-sub">Ensemble risk score &gt; 75%</div>
     </div>""", unsafe_allow_html=True)
 with col3:
     features_used = len(numeric_cols)
@@ -263,65 +354,173 @@ with col3:
         <div class="insight-sub">Numeric traffic features</div>
     </div>""", unsafe_allow_html=True)
 with col4:
-    clean_pct = 100 - anomaly_pct
     st.markdown(f"""
     <div class="insight-card">
-        <div class="insight-label">Clean Traffic</div>
-        <div class="insight-value" style="color:#00ff88;">{clean_pct:.0f}%</div>
-        <div class="insight-sub">{normal:,} normal flows</div>
+        <div class="insight-label">Stat vs ML Agreement</div>
+        <div class="insight-value" style="color:#00ff88;">{agreement_pct:.0f}%</div>
+        <div class="insight-sub">Rows where both layers agree</div>
     </div>""", unsafe_allow_html=True)
 
 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
-# ─── PCA 2D ANOMALY MAP ───────────────────────────────────────────────────────
-st.markdown('<div class="section-header">▸ PCA ANOMALY MAP — 2D PROJECTION</div>', unsafe_allow_html=True)
+# ─── PCA 2D BEHAVIOR MAP ──────────────────────────────────────────────────────
+st.markdown('<div class="section-header">▸ PCA BEHAVIOR MAP — CLUSTERED TRAFFIC PROJECTION</div>', unsafe_allow_html=True)
 
-if len(numeric_cols) >= 2:
-    pca_data = result_df[numeric_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    scaler_pca = SklearnScaler()
-    scaled_pca = scaler_pca.fit_transform(pca_data.values)
-    pca = PCA(n_components=2, random_state=42)
-    components = pca.fit_transform(scaled_pca)
-    var_explained = pca.explained_variance_ratio_
-
-    pca_df = pd.DataFrame({
-        'PC1': components[:, 0],
-        'PC2': components[:, 1],
-        'Label': result_df['__anomaly_label'].values,
-        'Risk': result_df['__risk_pct'].values,
-        'Score': result_df['__anomaly_score'].values,
-    })
-
-    normal_pts = pca_df[pca_df['Label'] == 'Normal']
-    anom_pts = pca_df[pca_df['Label'] == 'Anomalous']
-
-    fig_pca = go.Figure()
-    fig_pca.add_trace(go.Scattergl(
-        x=normal_pts['PC1'], y=normal_pts['PC2'],
-        mode='markers', name='Normal',
-        marker=dict(color='rgba(0,255,136,0.4)', size=4, line=dict(width=0)),
-        hovertemplate='PC1: %{x:.2f}<br>PC2: %{y:.2f}<extra>Normal</extra>'
-    ))
-    fig_pca.add_trace(go.Scattergl(
-        x=anom_pts['PC1'], y=anom_pts['PC2'],
-        mode='markers', name='Anomalous',
-        marker=dict(
-            color=anom_pts['Risk'],
-            colorscale=[[0, 'rgba(255,107,53,0.7)'], [1, 'rgba(255,51,102,1)']],
-            size=7, line=dict(color='rgba(255,51,102,0.8)', width=0.5),
-            showscale=True,
-            colorbar=dict(title='Risk%', tickfont=dict(color='rgba(0,245,255,0.6)', size=10))
-        ),
-        hovertemplate='PC1: %{x:.2f}<br>PC2: %{y:.2f}<br>Risk: %{marker.color:.0f}%<extra>ANOMALY</extra>'
-    ))
+if '__pca_1' in result_df.columns and '__pca_2' in result_df.columns:
+    fig_pca = px.scatter(
+        result_df,
+        x='__pca_1',
+        y='__pca_2',
+        color='__cluster_label',
+        size='__ml_risk_score',
+        symbol='__ml_anomaly_label',
+        color_continuous_scale='Turbo',
+        hover_data={
+            '__ml_risk_score': ':.2f',
+            '__risk_pct': ':.2f',
+            '__cluster_rarity_score': ':.2f',
+            '__cluster_label': True,
+            '__ml_anomaly_label': True,
+        }
+    )
+    fig_pca.update_traces(marker=dict(opacity=0.75, line=dict(width=0)))
     fig_pca.update_layout(
         **PLOTLY_LAYOUT,
-        xaxis_title=f'PC1 ({var_explained[0]*100:.1f}% variance)',
-        yaxis_title=f'PC2 ({var_explained[1]*100:.1f}% variance)',
-        title=dict(text='', x=0.5)
+        xaxis_title=f"PC1 ({result_df['__pca_variance_1'].iloc[0] * 100:.1f}% variance)",
+        yaxis_title=f"PC2 ({result_df['__pca_variance_2'].iloc[0] * 100:.1f}% variance)",
+        height=420,
+        coloraxis_colorbar=dict(title='Cluster')
     )
-    fig_pca.update_layout(height=420)
     st.plotly_chart(fig_pca, use_container_width=True)
+
+st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+
+# ─── STATISTICAL VS ML COMPARISON ─────────────────────────────────────────────
+st.markdown('<div class="section-header">▸ STATISTICAL VS ML ANOMALY COMPARISON</div>', unsafe_allow_html=True)
+
+if '__ml_risk_score' in result_df.columns:
+    compare_col1, compare_col2 = st.columns(2)
+
+    with compare_col1:
+        fig_compare = go.Figure()
+        for state, color in {
+            'Agreement': 'rgba(0,255,136,0.7)',
+            'Disagreement': 'rgba(255,51,102,0.85)'
+        }.items():
+            subset = result_df[result_df['__risk_alignment'] == state]
+            fig_compare.add_trace(go.Scattergl(
+                x=subset['__risk_pct'],
+                y=subset['__ml_risk_score'],
+                mode='markers',
+                name=state,
+                marker=dict(color=color, size=6),
+                hovertemplate=(
+                    'Statistical Risk: %{x:.1f}<br>'
+                    'ML Risk: %{y:.1f}<br>'
+                    'State: ' + state + '<extra></extra>'
+                )
+            ))
+        fig_compare.add_vline(x=50, line_dash='dash', line_color='rgba(0,245,255,0.35)')
+        fig_compare.add_hline(y=50, line_dash='dash', line_color='rgba(255,170,0,0.35)')
+        fig_compare.update_layout(
+            **PLOTLY_LAYOUT,
+            height=320,
+            xaxis_title='Statistical Risk Score',
+            yaxis_title='ML Ensemble Risk Score'
+        )
+        st.plotly_chart(fig_compare, use_container_width=True)
+
+    with compare_col2:
+        ml_compare = pd.DataFrame({
+            'Layer': ['Statistical', 'ML Ensemble', 'Isolation Forest'],
+            'High Risk Flows': [
+                int((result_df['__risk_pct'] >= 50).sum()),
+                int(result_df['__ml_is_anomaly'].sum()),
+                int(result_df['__iforest_is_anomaly'].sum()),
+            ]
+        })
+        fig_layer = go.Figure(go.Bar(
+            x=ml_compare['Layer'],
+            y=ml_compare['High Risk Flows'],
+            marker=dict(color=['rgba(0,245,255,0.7)', 'rgba(255,107,53,0.85)', 'rgba(255,51,102,0.8)'])
+        ))
+        fig_layer.update_layout(
+            **PLOTLY_LAYOUT,
+            height=320,
+            xaxis_title='Detection Layer',
+            yaxis_title='Flagged Flows'
+        )
+        st.plotly_chart(fig_layer, use_container_width=True)
+
+st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+
+# ─── CLUSTER ANALYSIS ─────────────────────────────────────────────────────────
+st.markdown('<div class="section-header">▸ TRAFFIC CLUSTER ANALYSIS</div>', unsafe_allow_html=True)
+
+if '__cluster_label' in result_df.columns:
+    cluster_summary = (
+        result_df
+        .groupby('__cluster_label', as_index=False)
+        .agg(
+            flow_count=('__cluster_label', 'size'),
+            avg_ml_risk=('__ml_risk_score', 'mean'),
+            avg_stat_risk=('__risk_pct', 'mean'),
+            avg_rarity=('__cluster_rarity_score', 'mean')
+        )
+        .sort_values('avg_ml_risk', ascending=False)
+    )
+
+    cluster_col1, cluster_col2 = st.columns(2)
+    with cluster_col1:
+        fig_cluster = go.Figure(go.Bar(
+            x=cluster_summary['flow_count'],
+            y=cluster_summary['__cluster_label'].astype(str),
+            orientation='h',
+            marker=dict(color=cluster_summary['avg_ml_risk'], colorscale='Turbo'),
+            customdata=np.stack(
+                [
+                    cluster_summary['avg_ml_risk'],
+                    cluster_summary['avg_stat_risk'],
+                    cluster_summary['avg_rarity']
+                ],
+                axis=1
+            ),
+            hovertemplate=(
+                'Cluster %{y}<br>'
+                'Flows: %{x}<br>'
+                'Avg ML Risk: %{customdata[0]:.1f}<br>'
+                'Avg Statistical Risk: %{customdata[1]:.1f}<br>'
+                'Avg Rarity: %{customdata[2]:.2f}<extra></extra>'
+            )
+        ))
+        fig_cluster.update_layout(
+            **PLOTLY_LAYOUT,
+            height=340,
+            xaxis_title='Flow Count',
+            yaxis_title='Cluster'
+        )
+        st.plotly_chart(fig_cluster, use_container_width=True)
+
+    with cluster_col2:
+        dbscan_counts = (
+            result_df['__dbscan_label']
+            .astype(str)
+            .value_counts()
+            .rename_axis('label')
+            .reset_index(name='count')
+        )
+        fig_dbscan = go.Figure(go.Bar(
+            x=dbscan_counts['label'],
+            y=dbscan_counts['count'],
+            marker=dict(color='rgba(0,245,255,0.65)')
+        ))
+        fig_dbscan.update_layout(
+            **PLOTLY_LAYOUT,
+            height=340,
+            xaxis_title='DBSCAN Label (-1 = rare/noise)',
+            yaxis_title='Flow Count'
+        )
+        st.plotly_chart(fig_dbscan, use_container_width=True)
 
 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
@@ -374,7 +573,8 @@ if numeric_cols and '__anomaly_score' in result_df.columns:
     for col in numeric_cols[:20]:
         try:
             c = result_df[col].replace([np.inf, -np.inf], np.nan).dropna()
-            s = result_df.loc[c.index, '__anomaly_score']
+            score_column = '__ml_risk_score' if '__ml_risk_score' in result_df.columns else '__anomaly_score'
+            s = result_df.loc[c.index, score_column]
             corr = np.corrcoef(c, s)[0, 1]
             if not np.isnan(corr):
                 corr_vals[col] = abs(corr)
@@ -396,7 +596,7 @@ if numeric_cols and '__anomaly_score' in result_df.columns:
         fig_corr.update_layout(
             **PLOTLY_LAYOUT,
             height=380,
-            xaxis_title='|Correlation with Anomaly Score|'
+            xaxis_title='|Correlation with Active Risk Score|'
         )
         # customize the y-axis separately to avoid passing the same key twice
         fig_corr.update_yaxes(
@@ -425,6 +625,15 @@ if '__anomaly_score' in result_df.columns:
         fill='tozeroy', fillcolor='rgba(0,245,255,0.05)'
     ))
 
+    if '__ml_risk_score' in timeline_df.columns:
+        fig_time.add_trace(go.Scatter(
+            x=list(range(len(timeline_df))),
+            y=timeline_df['__ml_risk_score'] / 100.0,
+            mode='lines',
+            name='ML Risk',
+            line=dict(color='rgba(255,107,53,0.85)', width=1.5)
+        ))
+
     anom_pts_t = timeline_df[timeline_df['__anomaly_label'] == 'Anomalous']
     if len(anom_pts_t) > 0:
         fig_time.add_trace(go.Scatter(
@@ -434,7 +643,7 @@ if '__anomaly_score' in result_df.columns:
             marker=dict(color='rgba(255,51,102,0.9)', size=6, symbol='circle')
         ))
 
-    threshold = timeline_df['__anomaly_score'].quantile(0.05)
+    threshold = timeline_df['__anomaly_score'].quantile(0.95)
     fig_time.add_hline(
         y=threshold, line_dash='dash',
         line_color='rgba(255,170,0,0.6)',

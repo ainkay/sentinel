@@ -14,9 +14,22 @@ Modules:
 
 from . import data_cleaning
 from . import feature_engineering
+from . import ml_anomaly
+from . import ml_clustering
+from . import ml_representation
+from . import ml_risk_model
 from . import statistical_analysis
 from . import risk_index
 
-__version__ = '2.0.0'
-__all__ = ['data_cleaning', 'feature_engineering', 'statistical_analysis', 'risk_index']
+__version__ = '2.1.0'
+__all__ = [
+	'data_cleaning',
+	'feature_engineering',
+	'ml_anomaly',
+	'ml_clustering',
+	'ml_representation',
+	'ml_risk_model',
+	'statistical_analysis',
+	'risk_index'
+]
 
