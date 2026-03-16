@@ -185,7 +185,16 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src import data_cleaning, feature_engineering, statistical_analysis, risk_index
+from src import (
+    data_cleaning,
+    feature_engineering,
+    ml_anomaly,
+    ml_clustering,
+    ml_representation,
+    ml_risk_model,
+    risk_index,
+    statistical_analysis,
+)
 
 # ─── RESPONSIVE NAV ───────────────────────────────────────────────────────────
 nav1, nav2, nav3, nav4, nav5 = st.columns([2, 1, 1, 1, 2])
@@ -356,6 +365,54 @@ if df is not None:
                 }
                 weights = {'zscore': 0.5, 'iqr': 0.5}
                 risk_scores = risk_index.compute_weighted_risk_index(indicators, weights)
+
+                # Machine learning layer: keep statistical detection intact and add
+                # unsupervised anomaly, clustering, and ensemble risk features.
+                isolation_model = ml_anomaly.train_isolation_forest(
+                    numeric_df,
+                    contamination=contamination,
+                    n_estimators=n_estimators,
+                )
+                isolation_scores = ml_anomaly.get_anomaly_scores(
+                    numeric_df,
+                    model=isolation_model,
+                )
+                isolation_flags = ml_anomaly.predict_anomalies(
+                    numeric_df,
+                    model=isolation_model,
+                )
+
+                pca_result = ml_representation.run_pca(numeric_df, n_components=2)
+                pca_components = pca_result['components']
+
+                kmeans_result = ml_clustering.run_kmeans(numeric_df, k=4)
+                dbscan_result = ml_clustering.run_dbscan(numeric_df)
+                euclidean_scores = ml_risk_model.euclidean_distance_score(
+                    kmeans_result['processed_data'],
+                    kmeans_result['cluster_centers']
+                )
+                mahalanobis_scores = ml_risk_model.mahalanobis_distance_score(
+                    kmeans_result['processed_data']
+                )
+                distance_scores = (euclidean_scores + mahalanobis_scores) / 2.0
+                cluster_rarity_scores = np.maximum(
+                    kmeans_result['rarity_scores'],
+                    dbscan_result['rarity_scores']
+                )
+                ml_risk_scores = ml_risk_model.compute_ml_risk_score(
+                    statistical_risk_score=risk_scores,
+                    isolation_forest_score=isolation_scores,
+                    cluster_rarity_score=cluster_rarity_scores,
+                    distance_deviation_score=distance_scores,
+                )
+                ml_risk_categories = risk_index.categorize_risk(ml_risk_scores)
+                ml_risk_flags = np.isin(ml_risk_categories, ['HIGH', 'CRITICAL'])
+
+                agreement_status = np.where(
+                    (risk_scores >= 50) == ml_risk_flags,
+                    'Agreement',
+                    'Disagreement'
+                )
                 
                 # Create result dataframe
                 result_df = df.copy()
@@ -363,11 +420,37 @@ if df is not None:
                 result_df['__risk_category'] = risk_index.categorize_risk(risk_scores)
                 result_df['__is_anomaly'] = result_df['__risk_category'].isin(['HIGH', 'CRITICAL'])
                 result_df['__anomaly_label'] = result_df['__is_anomaly'].map({True: 'Anomalous', False: 'Normal'})
+                result_df['__statistical_risk_score'] = risk_scores
+                result_df['__statistical_risk_category'] = result_df['__risk_category']
+                result_df['__statistical_anomaly_score'] = risk_scores / 100.0
                 
                 # For backwards compatibility with analytics page
                 result_df['__anomaly_score'] = risk_scores / 100.0
                 result_df['__risk_pct'] = risk_scores
                 result_df['__anomaly_flag'] = result_df['__is_anomaly'].map({True: -1, False: 1})
+                result_df['__iforest_anomaly_score'] = isolation_scores
+                result_df['__iforest_anomaly_pct'] = isolation_scores * 100.0
+                result_df['__iforest_is_anomaly'] = isolation_flags
+                result_df['__iforest_label'] = np.where(isolation_flags, 'Anomalous', 'Normal')
+                result_df['__cluster_label'] = kmeans_result['labels']
+                result_df['__dbscan_label'] = dbscan_result['labels']
+                result_df['__cluster_rarity_score'] = cluster_rarity_scores
+                result_df['__distance_deviation_score'] = distance_scores
+                result_df['__mahalanobis_score'] = mahalanobis_scores
+                result_df['__euclidean_distance_score'] = euclidean_scores
+                result_df['__ml_risk_score'] = ml_risk_scores
+                result_df['__ml_risk_category'] = ml_risk_categories
+                result_df['__ml_is_anomaly'] = ml_risk_flags
+                result_df['__ml_anomaly_label'] = np.where(ml_risk_flags, 'Anomalous', 'Normal')
+                result_df['__pca_1'] = pca_components.iloc[:, 0].values
+                result_df['__pca_2'] = pca_components.iloc[:, 1].values if pca_components.shape[1] > 1 else 0.0
+                result_df['__pca_variance_1'] = pca_result['explained_variance_ratio'][0]
+                result_df['__pca_variance_2'] = (
+                    pca_result['explained_variance_ratio'][1]
+                    if len(pca_result['explained_variance_ratio']) > 1
+                    else 0.0
+                )
+                result_df['__risk_alignment'] = agreement_status
                 
                 st.session_state['result_df'] = result_df.to_json()
                 scan_done = True
@@ -379,6 +462,8 @@ if df is not None:
         if scan_done:
             total = len(result_df)
             anomalies = (result_df['__anomaly_label'] == 'Anomalous').sum()
+            ml_anomalies = result_df['__ml_is_anomaly'].sum() if '__ml_is_anomaly' in result_df else 0
+            iforest_anomalies = result_df['__iforest_is_anomaly'].sum() if '__iforest_is_anomaly' in result_df else 0
             normal = total - anomalies
             anomaly_pct = anomalies / total * 100
             health = 100 - anomaly_pct
